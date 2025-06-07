@@ -1,10 +1,14 @@
 use clap::Parser;
 
 #[derive(Parser)]
-struct FilePath{
-    path : std::path::PathBuf,
+#[command(author, version, about, long_about = None)]
+struct Args {
+    #[arg(short, long, conflicts_with = "file")]
+    string: Option<String>,
+    
+    #[arg(short, long, value_name = "FILE", conflicts_with = "string")]
+    file: Option<std::path::PathBuf>,
 }
-
 struct Digest([[u8; 4]; 4]);
 
 const SHIFTS:[u32;64] = [
@@ -47,22 +51,95 @@ impl std::fmt::Display for Digest {
         Ok(())
     }
 }
+fn pre_process(last_chunk: &[u8], original_bit_length: u64) -> Vec<u8> {
+    let mut padded = last_chunk.to_vec();
+    padded.push(0x80); // Append a single '1' bit
+    while padded.len() % 64 != 56 { // Pad until length ≡ 56 mod 64
+        padded.push(0x00);
+    }
+    padded.extend_from_slice(&original_bit_length.to_le_bytes()); // Append length
+    padded
+}
 
-fn compute_md5<T>(reader: T)->Digest where T: std::io::Read {
-    let mut a0:u32 = 0x67452301;   // A
-    let mut b0:u32 = 0xefcdab89;   // B
-    let mut c0:u32 = 0x98badcfe;  // C
-    let mut d0:u32 = 0x10325476;  // D
+fn process_chunk(chunk: &[u8], a0: &mut u32, b0: &mut u32, c0: &mut u32, d0: &mut u32) {
+    let mut w: [u32; 16] = [0; 16];
+    for (i, chunk) in chunk.chunks(4).enumerate() {
+        w[i] = u32::from_le_bytes(chunk.try_into().unwrap());
+    }
+
+    let mut a = *a0;
+    let mut b = *b0;
+    let mut c = *c0;
+    let mut d = *d0;
+
+    for i in 0..64 {
+        let (f, g) = match i {
+            0..=15 => ((b & c) | (!b & d), i),
+            16..=31 => ((d & b) | (!d & c), (5 * i + 1) % 16),
+            32..=47 => (b ^ c ^ d, (3 * i + 5) % 16),
+            _ => (c ^ (b | !d), (7 * i) % 16),
+        };
+
+        let temp = f.wrapping_add(a).wrapping_add(K[i]).wrapping_add(w[g]);
+        a = d;
+        d = c;
+        c = b;
+        b = b.wrapping_add(temp.rotate_left(SHIFTS[i]));
+    }
+
+    *a0 = a0.wrapping_add(a);
+    *b0 = b0.wrapping_add(b);
+    *c0 = c0.wrapping_add(c);
+    *d0 = d0.wrapping_add(d);
+}
+
+fn compute_md5<T>(mut reader: T) -> Digest where T: std::io::Read {
+    let mut a0: u32 = 0x67452301; // A
+    let mut b0: u32 = 0xefcdab89; // B
+    let mut c0: u32 = 0x98badcfe; // C
+    let mut d0: u32 = 0x10325476; // D
+
+    let mut buffer = [0u8; 64];
+    let mut total_bytes = 0u64;
+    let mut remainder = Vec::new();
+
+    loop {
+        let bytes_read = reader.read(&mut buffer).expect("Failed to read from input");
+        if bytes_read == 0 {
+            break; // EOF
+        }
+        total_bytes += bytes_read as u64;
+
+        if bytes_read == 64 {
+            process_chunk(&buffer, &mut a0, &mut b0, &mut c0, &mut d0);
+        } else {
+            remainder.extend_from_slice(&buffer[..bytes_read]);
+            break;
+        }
+    }
+    let padded = pre_process(&remainder, total_bytes * 8);
+    for chunk in padded.chunks(64) {
+        process_chunk(chunk, &mut a0, &mut b0, &mut c0, &mut d0);
+    }
 
     Digest([
         a0.to_le_bytes(),
         b0.to_le_bytes(),
-        c0.to_le_bytes(), 
-        d0.to_le_bytes()]);
-    }
+        c0.to_le_bytes(),
+        d0.to_le_bytes(),
+    ])
+}
 fn main() {
-    let path = FilePath::parse();
-    let file = std::fs::File::open(path.path).expect("Failed to open file");
-    let reader = std::io::BufReader::new(file);
-    println!("Hello, world!");
+    let args = Args::parse();
+    let digest = if let Some(s) = args.string {
+        compute_md5(s.as_bytes())
+    } else if let Some(path) = args.file {
+        let file = std::fs::File::open(path).expect("Failed to open file");
+        let reader = std::io::BufReader::new(file);
+        compute_md5(reader)
+    } else {
+        eprintln!("Either --string or --file must be provided.");
+        std::process::exit(1);
+    };
+    println!("{digest}");
 }
